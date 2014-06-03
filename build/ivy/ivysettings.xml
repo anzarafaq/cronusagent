@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ivysettings>
+    <settings defaultResolver="sbe-repo" defaultConflictManager="latest-revision">
+        <caches defaultCacheDir="${dir.repo.cache}" useOrigin="true"/>
+    </settings>
+    <namespaces>
+        <namespace name="maven2">
+            <rule>
+                <fromsystem>
+                    <src org="apache" module=".+"/>
+                    <dest org="$m0" module="$m0"/>
+                </fromsystem>
+                <tosystem>
+                    <src org="xmlrpc" module="xmlrpc"/>
+                    <dest org="apache" module="$m0"/>
+                </tosystem>
+            </rule>
+        </namespace>
+    </namespaces>
+    <resolvers>
+        <filesystem name="local">
+            <ivy pattern="${dir.repo.local}/[organisation]/[module]/[revision]/ivy-[revision].xml"/>
+            <artifact pattern="${dir.repo.local}/[organisation]/[module]/[revision]/[artifact]-[revision].[ext]"/>
+            <artifact pattern="${dir.repo.local}/[organisation]/[module]/[revision]/[artifact].[ext]"/>
+        </filesystem>
+        <url name="shared.qa">
+            <ivy pattern="${url.repo.qa.shared}/[organisation]/[module]/[revision]/ivy-[revision].xml"/>
+            <artifact pattern="${url.repo.qa.shared}/[organisation]/[module]/[revision]/[artifact]-[revision]-[type].[ext]"/>
+            <artifact pattern="${url.repo.qa.shared}/[organisation]/[module]/[revision]/[artifact]-[revision].[ext]"/>
+            <artifact pattern="${url.repo.qa.shared}/[organisation]/[module]/[revision]/[artifact].[ext]"/>
+        </url>
+        <url name="shared">
+            <ivy pattern="${url.repo.shared}/[organisation]/[module]/[revision]/ivy-[revision].xml"/>
+            <artifact pattern="${url.repo.shared}/[organisation]/[module]/[revision]/[artifact]-[revision]-[type].[ext]"/>
+            <artifact pattern="${url.repo.shared}/[organisation]/[module]/[revision]/[artifact]-[revision].[ext]"/>
+            <artifact pattern="${url.repo.shared}/[organisation]/[module]/[revision]/[artifact].[ext]"/>
+        </url>
+        <filesystem name="shared-publish">
+            <ivy pattern="${dir.repo.shared}/[organisation]/[module]/[revision]/ivy-[revision].xml"/>
+            <artifact pattern="${dir.repo.shared}/[organisation]/[module]/[revision]/${pattern.publish.artifact}"/>
+        </filesystem>
+        <url name="cronus.3rdparty">
+            <ivy pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/ivy-[revision].xml"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[type]s/[artifact]-[revision]-[type].[ext]"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[type]s/[artifact]-[revision].[ext]"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[type]s/[artifact].[ext]"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[ext]s/[artifact]-[revision]-[type].[ext]"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[ext]s/[artifact]-[revision].[ext]"/>
+            <artifact pattern="http://repository.qa.ebay.com/cronus/3rdparty/[organisation]/[module]/[ext]s/[artifact].[ext]"/>
+        </url>
+        <ibiblio name="ebay.central.maven.mirror.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/nexus/central/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.central.maven.mirror.corp"
+            m2compatible="true"
+            root="http://nxrepository.corp.ebay.com/nexus/content/repositories/central/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.central.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/central/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.central"
+            m2compatible="true"
+            root="http://repository.corp.ebay.com/central/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.3rdparty.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/3rdparty/"
+            namespace="maven2"/>            
+        <ibiblio name="ebay.3rdparty"
+            m2compatible="true"
+            root="http://repository.corp.ebay.com/3rdparty/"
+            namespace="maven2"/>
+         <ibiblio name="ebay.ebox.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/ebox/releases/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.ebox"
+            m2compatible="true"
+            root="http://repository.corp.ebay.com/ebox/releases/"
+            namespace="maven2"/>
+        <ibiblio name="ebay.releases.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/releases/"
+            namespace="maven2"/>     
+        <ibiblio name="ebay.releases"
+            m2compatible="true"
+            root="http://repository.corp.ebay.com/releases/"
+            namespace="maven2"/>
+        <ibiblio name="maven2"
+            m2compatible="true"
+            root="http://repo1.maven.org/maven2"
+            namespace="maven2"/>
+        <ibiblio name="jboss"
+            m2compatible="true"
+            root="http://repository.jboss.com/maven2"
+            namespace="maven2"/>
+         <ibiblio name="ebay.restlet.qa"
+            m2compatible="true"
+            root="http://repository.qa.ebay.com/nexus/restlet.proxy/"
+            namespace="maven2"/>
+         <ibiblio name="ebay.restlet.corp"
+            m2compatible="true"
+            root="http://nxrepository.corp.ebay.com/nexus/content/repositories/restlet.proxy/"
+            namespace="maven2"/>         
+        <ibiblio name="restlet"
+            m2compatible="true"
+            root="http://maven.restlet.org"
+            namespace="maven2"/>
+        <ibiblio name="restlet-nonmaven"
+            m2compatible="false"
+            root="http://maven.restlet.org"
+            namespace="maven2"
+            pattern="[organization]/[module]/[revision]/[module]-[revision].[ext]"/>
+        <ibiblio name="ibibliomirror"
+            m2compatible="true"
+            root="http://mirrors.ibiblio.org/pub/mirrors/maven2"
+            namespace="maven2"/>
+        <chain name="sbe-repo" returnFirst="true" dual="true">
+            <resolver ref="local"/>
+            <resolver ref="shared.qa"/>
+            <resolver ref="shared"/>
+            <resolver ref="ebay.central.maven.mirror.qa"/>
+            <resolver ref="ebay.central.maven.mirror.corp"/>
+            <resolver ref="ebay.central.qa"/>
+            <resolver ref="ebay.central"/>
+            <resolver ref="ebay.3rdparty.qa"/>
+            <resolver ref="ebay.3rdparty"/>
+            <resolver ref="ebay.ebox.qa"/>
+            <resolver ref="ebay.ebox"/>
+            <resolver ref="ebay.releases.qa"/>
+            <resolver ref="ebay.releases"/>            
+            <resolver ref="jboss"/>
+	    <resolver ref="cronus.3rdparty"/>
+            <resolver ref="ebay.restlet.qa"/>
+            <resolver ref="ebay.restlet.corp"/>
+            <resolver ref="maven2"/>
+            <resolver ref="restlet-nonmaven"/>
+            <resolver ref="restlet"/>
+            <resolver ref="ibibliomirror"/>
+        </chain>
+    </resolvers>
+</ivysettings>

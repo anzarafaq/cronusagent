@@ -1,0 +1,930 @@
+#!/usr/bin/env bash
+
+# agent-upgrade : Install / upgrade a Cronus Agent on localhost.
+# 
+# Example:
+#   $ agent-upgrade 0.1.655
+#
+# This script makes the following assumptions:
+# - The script runs as user "cronus".
+# - The OS already has the "cronus" and "cronusapp" users.
+# - The cronus user has uid 78389, the cronusapp user has uid 78402.
+# - The OS has a the "app" group with gid 61000.
+# - The primary group of the "cronus" and "cronusapp" users is "app".
+# - The /ebay/cronus/software dir exists, with the /ebay/cronus/software
+#   directory owned by user "cronus", group "app".
+# - The cronus and cronusapp users are configured for passwordless sudo access.
+# - There may already be an agent installed and running, and if so, this
+#   script needs to shut it down as gracefully as reasonably possible.
+# - Any pre-existing agent is configured to respawn with upstart or daemontools.
+# - The OS has either curl or wget installed.
+# See this page:
+# http://wiki2.arch.ebay.com/display/CLOUD/Install+Agent+on+Feature+Linux+Machine
+#
+# This script DOES NOT:
+# - Require any agent to have been already installed.  This script is able to
+#   perform first-time installations of the cronus agent.
+# - Require the agent to be in working condition.  This script will install
+#   over any existing agent of the same version, or will install a new version
+#   alongside an existing version, and will switch to using the new version.
+# - Require the user to manually restart the agent after installation or
+#   upgrade.  This script will perform any necessary shutdown and (re)start.
+#
+# $Id: agent-upgrade 7135 2012-07-17 04:31:49Z jbrittain $
+# ----------------------------------------------------------------------
+
+# Set variable defaults if the user didn't already set values for them.
+if [ ! $INSTALL_AGENT_VERSION ]; then
+  INSTALL_AGENT_VERSION="0.1.671"
+fi
+if [ ! $INSTALL_PYTHON_VERSION ]; then
+  INSTALL_PYTHON_VERSION="1.0.0"
+fi
+if [ ! $INSTALL_LOG_TIMESTAMP ]; then
+  INSTALL_LOG_TIMESTAMP="yes"
+fi
+if [ ! $INSTALL_LOG_LEVEL ]; then
+  INSTALL_LOG_LEVEL="yes"
+fi
+if [ ! $SHUTDOWN_SIGTERM_WAIT ]; then
+  SHUTDOWN_SIGTERM_WAIT=20
+fi
+if [ ! $SHUTDOWN_SIGKILL_WAIT ]; then
+  SHUTDOWN_SIGKILL_WAIT=20
+fi
+if [ ! $AGENT_ROOT ]; then
+  AGENT_ROOT="/ebay/cronus/software"
+fi
+if [ ! $INSTALL_DOWNLOAD_DIR ]; then
+  INSTALL_DOWNLOAD_DIR="$AGENT_ROOT/packages"
+fi
+if [ ! $CRONUS_PKGS_URL ]; then
+  CRONUS_PKGS_URL="http://cronus-srepo.vip.ebay.com/packages"
+fi
+SERVICE_NODES="$AGENT_ROOT/service_nodes"
+PACKAGES="$AGENT_ROOT/packages"
+AGENT_MANIFESTS="$SERVICE_NODES/agent/manifests"
+AGENT_INSTALLED_PACKAGES="$SERVICE_NODES/agent/installed-packages"
+AGENT_MANIFESTS_ACTIVE="$AGENT_MANIFESTS/active"
+
+# Detect whether this script has a controlling terminal.
+INSTALL_READ_TTY=0
+if test -t 0; then INSTALL_READ_TTY=1; fi
+INSTALL_WRITE_TTY=0
+if test -t 1; then INSTALL_WRITE_TTY=1; fi
+
+# Detect major OS type.
+linux=false
+cygwin=false
+darwin=false
+solaris=false
+case "`uname`" in
+  Linux*)  linux=true;;
+  CYGWIN*) cygwin=true;;
+  Darwin*) darwin=true;;
+  SunOS*)  solaris=true;;
+esac
+
+INSTALL_LOG_DIR="$HOME/install-agent-logs"
+mkdir -p "$HOME/install-agent-logs"
+if [ $? -ne 0 ]; then
+  INSTALL_LOG_DIR="/tmp"
+fi
+INSTALL_LOG_FILE="$INSTALL_LOG_DIR/`date +%F`"
+
+# Set colors and other terminal codes.
+setVT100Styles() {
+  if [ "$COLOR_TERMINAL" != "false" ]; then
+    RED="[31;01m"
+    PURPLE="[35;01m"
+    GREEN="[32;01m"
+    GREENONBLACK="[32;40m"
+    REDONBLACK="[31;40m"
+    BB="[40m"
+    BOLD="[1;1m"
+    UNDER="[4m"
+    OFF="[0m"
+    LEFT="[999D"
+  fi
+}
+setVT100Styles
+
+# Tell bash to keep checking for terminal window resize events.
+COLUMNS=`tput cols`
+shopt -s checkwinsize
+
+# Set plain text: no colors, nor other terminal codes.
+setPlainStyles() {
+  RED=""
+  PURPLE=""
+  GREEN=""
+  GREENONBLACK=""
+  REDONBLACK=""
+  BB=""
+  BOLD=""
+  UNDER=""
+  OFF=""
+  LEFT=""
+}
+
+showMilestoneStatus() {
+  local logFunction=$1
+  local plainStatus="$2"
+  local colorStatus="$3"
+  shift; shift; shift
+  local msg="$@"
+
+  if [[ $INSTALL_READ_TTY -eq 1 && $INSTALL_WRITE_TTY -eq 0 || ( ! -t 1 && \
+     ! "$COLOR_TERMINAL" ) ]]; then
+    # There's no color terminal.
+    setPlainStyles
+    eval $logFunction \"\$msg \[\$plainStatus\]\"
+  else
+    setVT100Styles
+    local col room
+    let col=$COLUMNS-${#plainStatus}-2
+    let room=col-${#msg}+1
+    if [ "$INSTALL_LOG_TIMESTAMP" == "yes" ]; then let room=$room-20; fi
+    if [ "$INSTALL_LOG_LEVEL" == "yes" ]; then let room=$room-${#plainStatus}-2; fi
+    if [ $room -lt 0 ]; then
+      eval $logFunction \"\$msg\" \"\"
+      eval logToConsole \"$colorStatus\"
+    else
+      eval $logFunction \"\$msg\" \"$colorStatus\"
+    fi
+  fi
+}
+
+showFAIL() {
+  local msg="$@"
+  showMilestoneStatus error " FAIL " "${LEFT}${OFF}[\${col}C${BOLD}${BB}[ ${REDONBLACK}FAIL${OFF}${BOLD}${BB}  ]${OFF}" ${msg}
+}
+
+showOK() {
+  local msg="$@"
+  showMilestoneStatus info "  OK   " "${LEFT}${OFF}[\${col}C${BOLD}${BB}[  ${GREENONBLACK}OK${OFF}${BOLD}${BB}   ]${OFF}" ${msg}
+}
+
+showSUCCESS() {
+  local msg="$@"
+  showMilestoneStatus info "SUCCESS" "${LEFT}${OFF}[\${col}C${BOLD}${BB}[${GREENONBLACK}SUCCESS${OFF}${BOLD}${BB}]${OFF}" ${msg}
+}
+
+log() {
+  local log_str="$1"
+  local loglevel="[INFO]"
+  logToConsole "$log_str"  "$loglevel"
+}
+
+logToConsole() {
+  local log_str="$1"
+  local loglevel="$2"
+  if [ ! "$INSTALL_TIMESTAMP" ] || [ "$INSTALL_LOG_TIMESTAMP" == "yes" ]; then
+    local timestamp
+    timestamp=`date "+%m-%d-%Y %H:%M.%S"`
+  fi
+  if [ "$timestamp" ]; then
+    if [ "$loglevel" ]; then
+      echo "$timestamp $loglevel $log_str"
+    else
+      echo "$timestamp $log_str"
+    fi
+  else
+    if [ "$loglevel" ]; then
+      echo "$loglevel $log_str"
+    else
+      echo "$log_str"
+    fi
+  fi
+}
+
+info() {
+  local mesg="$1"
+  local consoleMesg="$mesg $2"
+  if [ "$INSTALL_LOG_LEVEL" == "yes" ]; then
+    local level="[INFO]"
+  fi
+  logToConsole "$consoleMesg"  "$level"
+}
+
+error() {
+  local mesg="$1"
+  local consoleMesg="$mesg $2"
+  if [ "$INSTALL_LOG_LEVEL" == "yes" ]; then
+    local level="[${RED}ERROR${OFF}]"
+  fi
+  logToConsole "$consoleMesg"  "$level"
+}
+
+warn() {
+  local mesg="$1"
+  local consoleMesg="$mesg $2"
+  if [ "$INSTALL_LOG_LEVEL" == "yes" ]; then
+    local level="[${PURPLE}WARN${OFF}]"
+  fi
+  logToConsole "$consoleMesg"  "$level"
+}
+
+attn() {
+  local mesg="$1"
+  if [ "$INSTALL_LOG_LEVEL" == "yes" ]; then
+    local level="[${GREEN}ATTN${OFF}]"
+  fi
+  logToConsole "$mesg"  "$level"
+}
+
+# Use this to detect the OS brand such as "Ubuntu" or "Macos", the OS version
+# such as "11.10", and the OS architecture such as "i686" or "x86_64".
+# This function sets the following variables (declare them as local variables
+# in your function before you call this function):
+#   osBrand osVersion osArch
+detectOS() {
+  osArch="`uname -m`"
+  uname -a | grep Linux >>/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    # Debian, RHEL, CentOS, Gentoo, others.
+    osBrand="`lsb_release -i | cut -d':' -f 2`"
+    osBrand="${osBrand//[[:space:]]/}"
+    osVersion="`lsb_release -r | cut -d':' -f 2`"
+    osVersion="${osVersion//[[:space:]]/}"
+  else
+    uname -a | grep Darwin >>/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+      osBrand="Macos"
+      osVersion="`sw_vers -productVersion`"
+      if [[ "$osVersion" =~ (^10.6) ]]; then osVersion="10.6"; fi
+      if [[ "$osVersion" =~ (^10.7) ]]; then osVersion="10.7"; fi
+      if [[ "$osVersion" =~ (^10.8) ]]; then osVersion="10.8"; fi
+    else
+      uname -a | grep SunOS >>/dev/null 2>&1
+      if [ $? -eq 0 ]; then
+        osBrand="Solaris"
+        osVersion="`uname -r | cut -d'.' -f 2`"
+      else
+        osBrand="unknown"
+        osVersion="unknown"
+      fi
+    fi
+  fi
+
+  #echo $osBrand $osVersion $osArch
+}
+
+# Download a file using either curl or wget.  Here are the arguments to pass:
+#   downloadUrl  : The URL of the file we're downloading.
+#   downloadFile : The file path (including the ending filename) on the local
+#                  filesystem where we're storing the file.
+downloadFile() {
+  local downloadUrl="$1"
+  local downloadFile="$2"
+
+  info "Downloading $downloadUrl to $downloadFile .."
+  info "Inspect this log file for details: $INSTALL_LOG_FILE"
+
+  # Detect which HTTP client we'll use to download the package (either curl or wget)
+  local getCommand="curl --progress-bar -L -o"
+  which curl >/dev/null 2>&1
+  if [ $? -ne 0 ]; then
+    getCommand="wget --no-check-certificate -t 1 -o $INSTALL_LOG_FILE -O"
+  fi
+
+  # TODO: run inside a spinner.
+  touch "$INSTALL_LOG_FILE" >/dev/null 2>&1
+  $getCommand "$downloadFile" "$downloadUrl"
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    rm -f "$downloadFile" >>$INSTALL_LOG_FILE 2>&1
+    return 1
+  fi
+  return 0
+}
+
+# This function gets a package file from $CRONUS_PKGS_URL, either by
+# downloading it from the cronus repository, or by copying it from a local
+# filesystem directory.  When successful, the cronus package file resides
+# in the specified destination dir.
+# Arguments:
+#   packageFilename : The filename of the cronus package file to get.
+#   destinationDir  : The absolute path to the destination directory.
+getPackageFile() {
+  local packageFilename="$1"
+  local destinationDir="$2"
+  local force="$3"
+
+  local retval=0
+
+  if [ "$force" != "" ]; then
+    rm -f "$destinationDir/$packageFilename" >>$INSTALL_LOG_FILE 2>&1
+  fi
+
+  # See if we already got the package file.
+  test -r "$destinationDir/$packageFilename" >>$INSTALL_LOG_FILE 2>&1
+  local pkgFileExists=$?
+  if [ $pkgFileExists -ne 0 ]; then
+    mkdir -p $destinationDir >>$INSTALL_LOG_FILE 2>&1
+    let retval=$?
+    if [ $retval -ne 0 ]; then
+      error "Could not create package destination directory $destinationDir"
+      return 1
+    fi
+
+    # If CRONUS_PKGS_URL is set to a non-url, use that as a local filesystem directory.
+    if [[ "$CRONUS_PKGS_URL" =~ (http[s]?:) ]]; then
+      downloadFile "$CRONUS_PKGS_URL/$packageFilename" "$INSTALL_DOWNLOAD_DIR/$packageFilename"
+    else
+      info "Looking for $packageFilename in local directory $CRONUS_PKGS_URL"
+      # Just copy the package from a local filesystem directory, instead of downloading.
+      if [ -r "$CRONUS_PKGS_URL/$packageFilename" ]; then
+        cp "$CRONUS_PKGS_URL/$packageFilename" "$destinationDir/$packageFilename" >>$INSTALL_LOG_FILE 2>&1
+        let retval=$?
+        if [ $retval -ne 0 ]; then
+          error "Couldn't copy $CRONUS_PKGS_URL/$packageFilename to $destinationDir/$packageFilename"
+          return 1
+        else
+          info "Copied package file $packageFilename"
+        fi
+      else
+        error "Unable to find package file $packageFilename in local download dir $CRONUS_PKGS_URL"
+        return 1
+      fi
+    fi
+  fi
+  test -r $destinationDir/$packageFilename >>$INSTALL_LOG_FILE 2>&1
+  local pkgFileExists=$?
+  if [ $pkgFileExists -ne 0 ]; then
+    error "Couldn't download cronus package $CRONUS_PKGS_URL/$packageFilename for installation."
+    return 1
+  fi
+
+  return 0
+}
+
+installCronusPackage() {
+  local packageFilename="$1"
+
+  local retval=0
+
+  getPackageFile $packageFilename $INSTALL_DOWNLOAD_DIR
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    return $retval;
+  fi
+
+  # Get the package's name from the package filename.
+  local packageNameAndVersion=$(basename $packageFilename)
+  local packageName=$(echo $packageNameAndVersion | sed -e 's/\(.*\)-\(.*\).cronus/\1/')
+  local packageVersion=$(echo $packageNameAndVersion | sed -e 's/\(.*\)-\(.*\).cronus/\2/')
+  if [[ "$packageNameAndVersion" == "" || "$packageName" == "" || \
+        "$packageVersion" == "" ]]; then
+    error "Can't install package: Unable to parse the package name and version from \"$packageFilename\""
+    return 1
+  fi
+
+  # Ensure that the package's installation directory exists.
+  if [ ! -r $AGENT_INSTALLED_PACKAGES/$packageName/$packageVersion ]; then
+    mkdir -p $AGENT_INSTALLED_PACKAGES/$packageName/$packageVersion >> $INSTALL_LOG_FILE 2>&1
+    let retval=$?
+    if [ $retval -ne 0 ]; then
+      error "Could not create package installation directory $baseDir/$packageName/$packageVersion"
+      return 1
+    fi
+  fi
+
+  tar xvf $INSTALL_DOWNLOAD_DIR/$packageFilename -C $AGENT_INSTALLED_PACKAGES/$packageName/$packageVersion >> $INSTALL_LOG_FILE 2>&1
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    error "Couldn't unpack $INSTALL_DOWNLOAD_DIR/$packageFilename into directory $AGENT_INSTALLED_PACKAGES/$packageName/$packageVersion."
+    return 1
+  fi
+
+  return $retval
+}
+
+# This function activates a specified version of a specified package.
+activatePackageVersion() {
+  local packageName="$1"
+  local packageVersion="$2"
+  local packageArch="$3"
+  local installedPkgsDir="$4"
+
+  # Create the symlink to make this version of the package active.
+  if [ ! -d "$AGENT_MANIFESTS" ]; then
+    mkdir -p "$AGENT_MANIFESTS" >>$INSTALL_LOG_FILE 2>&1 || {
+      error "Couldn't create the agent manifests dir $AGENT_MANIFESTS"
+      return 1
+    }
+  fi
+  pushd "$AGENT_MANIFESTS"
+  if [ ! -h "active" ]; then
+    mkdir -p manifest-1.0 >>$INSTALL_LOG_FILE 2>&1 && \
+    ln -f -s "manifest-1.0" "active" >>$INSTALL_LOG_FILE 2>&1 || {
+      error "Couldn't create the active manifest dir and/or active symlink."
+      return 1
+    }
+  fi
+  pushd "$AGENT_MANIFESTS_ACTIVE" >/dev/null 2>&1
+  rm -f "$packageName" >>$INSTALL_LOG_FILE 2>&1
+  if [[ ! "$packageArch" =~ (^\.) ]] && [[ ! "$packageArch" =~ (^prod) ]]; then
+    packageArch=".${packageArch}"
+  fi
+  ln -f -s "$installedPkgsDir/$packageName/${packageVersion}${packageArch}/" "$packageName"
+  popd >/dev/null 2>&1
+
+  # Run the package's install script.
+  if [ -x "$AGENT_MANIFESTS_ACTIVE/$packageName/cronus/scripts/install" ]; then
+    info "Calling install script of package $packageName .."
+    "$AGENT_MANIFESTS_ACTIVE/$packageName/cronus/scripts/install" >>$INSTALL_LOG_FILE 2>&1 || {
+      error "Error running the install script."
+      return 1
+    }
+    info "Install script for $packageName complete."
+  fi
+
+  # Run the package's activate script.
+  if [ -x "$AGENT_MANIFESTS_ACTIVE/$packageName/cronus/scripts/activate" ]; then
+    info "Calling activate script of package $packageName .."
+    "$AGENT_MANIFESTS_ACTIVE/$packageName/cronus/scripts/activate" >>$INSTALL_LOG_FILE 2>&1 || {
+      error "Error running the activate script."
+      return 1
+    }
+    info "Activate script for $packageName complete."
+  fi
+
+  return 0
+}
+
+# This function installs an agent, assuming no agent is installed nor running.
+install() {
+  local agentVersion="$1"
+  local pythonVersion="$2"
+  local packagesDir="$3"
+
+  if [ ! $osBrand ]; then
+    # Detect the OS brand, version, and architecture.
+    local osBrand osVersion osArch
+    detectOS
+
+    # TODO: Stop here if the OS brand/version/arch trio is something that
+    #       the agent does not support.
+  fi
+
+  # Detect whether the current user has write permission to install.
+  detectWritableTree
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  installCronusPackage $pythonPackage
+  let retval=$?
+  if [ $retval -eq 0 ]; then
+    info "Python package $pythonVersion installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+  else
+    error "Python package $pythonVersion not installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+    return 1
+  fi
+
+  installCronusPackage $agentConfigPackage
+  let retval=$?
+  if [ $retval -eq 0 ]; then
+    info "agent_config $agentVersion package installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+  else
+    error "agent_config $agentVersion package not installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+    return 1
+  fi
+
+  installCronusPackage $agentPackage
+  let retval=$?
+  if [ $retval -eq 0 ]; then
+    info "agent $agentVersion package installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+  else
+    error "agent $agentVersion package not installed on $HOSTNAME ($osBrand $osVersion $osArch)"
+    return 1
+  fi
+
+  # Install the service respawn configuration.
+  if [ -x /sbin/initctl ]; then
+    installUpstartConfig
+    let retval=$?
+    if [ $retval -eq 0 ]; then
+      info "Upstart configuration installed."
+    else
+      error "Upstart configuration not installed."
+    fi
+  else
+    installDaemontoolsConfig
+    let retval=$?
+    if [ $retval -eq 0 ]; then
+      info "Daemontools configuration installed."
+    else
+      error "Daemontools configuration not installed."
+    fi
+  fi
+
+  return $retval
+}
+
+# This function installs an Upstart configuration file for the agent.
+installUpstartConfig() {
+  local retval
+
+  info "Installing an upstart configuration file for this agent."
+  local upstartConfUrl="https://svn.corp.ebay.com/mc2009/cronus_util/trunk/cronus_util/install_scripts/cronus.conf"
+  downloadFile $upstartConfUrl /tmp/cronus.conf
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    error "Couldn't download upstart config file $upstartConfUrl to /tmp/cronus.conf"
+    return $retval
+  fi
+
+  # Passwordless sudo, as long as the OS is configured properly (see top comments).
+  sudo cp /tmp/cronus.conf /etc/init/cronus.conf  >>$INSTALL_LOG_FILE 2>&1
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    error "Couldn't install upstart config file /etc/init/cronus.conf"
+  fi
+  rm -f /tmp/cronus.conf >/dev/null 2>&1
+
+  return $retval
+}
+
+# This function installs a daemontools configuration file for the agent.
+installDaemontoolsConfig() {
+  local retval
+
+  info "Installing a daemontools configuration file for this agent."
+  # TODO
+
+  return $retval
+}
+
+detectWritableTree() {
+  local agentVersion="$1"
+  if [ -d "$AGENT_ROOT" ] && \
+     ([ ! -w "$AGENT_ROOT" ] || [ ! -x "$AGENT_ROOT" ]); then
+    showFAIL "User $USER does not have write or execute perm for dir $AGENT_ROOT"
+    return 1
+  fi
+
+  if [ -d "$SERVICE_NODES" ] && \
+     ([ ! -w "$SERVICE_NODES" ] || [ ! -x "$SERVICE_NODES" ]); then
+    showFAIL "User $USER does not have write or execute perm for dir $SERVICE_NODES"
+    return 1
+  fi
+
+  if [ -d "$SERVICE_NODES/agent" ] && \
+     ([ ! -w "$SERVICE_NODES/agent" ] || [ ! -x "$SERVICE_NODES/agent" ]); then
+    showFAIL "User $USER does not have write or execute perm for dir $SERVICE_NODES/agent"
+    return 1
+  fi
+
+  if [ -d "$AGENT_MANIFESTS" ] && \
+     ([ ! -w "$AGENT_MANIFESTS" ] || [ ! -x "$AGENT_MANIFESTS" ]); then
+    showFAIL "User $USER does not have write or execute perm for dir $AGENT_MANIFESTS"
+    return 1
+  fi
+
+  if [ -d "$AGENT_INSTALLED_PACKAGES" ] && \
+     ([ ! -w "$AGENT_INSTALLED_PACKAGES" ] || [ ! -x "$AGENT_INSTALLED_PACKAGES" ]); then
+    showFAIL "User $USER does not have write or execute perm for dir $AGENT_INSTALLED_PACKAGES"
+    return 1
+  fi
+
+  return 0
+}
+
+# This function just detects whether the Cronus Agent (any version) is installed.
+detectAgentInstalled() {
+  if [ -f "$AGENT_MANIFESTS" ] && [ -f "$AGENT_INSTALLED_PACKAGES" ] && \
+     [ -h "$AGENT_MANIFESTS_ACTIVE" ]; then
+    # Agent is installed.
+    return 0
+  fi
+
+  # Agent is not installed.
+  return 1
+}
+
+# This function detects whether the version we're installing is already installed.
+detectSameVersionInstalled() {
+  local agentVersion="$1"
+  if [ -f "$AGENT_INSTALLED_PACKAGES/agent/${agentVersion}.unix" ]; then
+    # The same version of the agent is installed.
+    return 0
+  fi
+
+  # This version of the agent is not installed.
+  return 1
+}
+
+# Perform as graceful of a shutdown of the agent as possible.
+stopAgent() {
+  local retval
+  let retval=0
+
+  # TODO: Support the case where the process is running and the agent's
+  #       installation files are all deleted.
+
+  # Detect whether the agent is running, based on the PID file.
+  local pidFile="$AGENT_MANIFESTS_ACTIVE/agent/agent.pid"
+  local pid
+  if [ -f "$pidFile" ]; then
+    # Check to see if the process ID in the pid file is running.
+    pid=$(cat "$pidFile")
+    ps -p $pid >>/dev/null 2>&1
+    let retval=$?    
+    if [ $retval -eq 0 ]; then
+      # It's running.
+      info "Previously installed agent instance is currently running."
+      attn "Shutting down agent process ID $pid.."
+
+      # Determine whether to stop it via upstart, daemontools, or another way.
+      if [ -x /sbin/initctl ]; then
+        info "Using upstart (sudo stop cronus) to stop the agent."
+        # Passwordless sudo, if the OS was configured properly.  See top comments.
+        sudo stop cronus >>$INSTALL_LOG_FILE 2>&1
+        let retval=$?
+        if [ $retval -ne 0 ]; then
+          info "Upstart agent stop command (sudo stop cronus) returned nonzero."
+        fi
+      else
+        which svc >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+          info "Using daemontools (sudo svc -d cronus) to stop the agent."
+          # Passwordless sudo, if the OS was configured properly.  See top comments.
+          sudo svc -d cronus >>$INSTALL_LOG_FILE 2>&1
+          let retval=$?
+          if [ $retval -ne 0 ]; then
+            info "Daemontools agent stop command (sudo svc -d cronus) returned nonzero."
+          fi
+        else
+          # We don't have upstart nor daemontools.  Just call the cronus stop script.
+          local shutdownScript="$AGENT_MANIFESTS_ACTIVE/agent/cronus/scripts/shut"
+          if [ -x "$shutdownScript" ]; then
+            info "Using the cronus stop script ($shutdownScript) to stop the agent."
+            "$shutdownScript" >>$INSTALL_LOG_FILE 2>&1
+            # Currently the agent's "shut" script always returns 0, so we need to
+            # check for ourselves whether it's still running.
+          fi
+        fi
+      fi
+
+      # TODO: Potentially sleep for a short period of time after the service stop
+      #       command completed, but before we send subsequent stop signals.
+
+      # Detect whether it's still running.
+      ps -p $pid >>/dev/null 2>&1
+      let retval=$?
+      if [ $retval -eq 0 ]; then
+        # It's still running, so we'll send a SIGTERM next.
+        kill -15 $pid
+
+        # Wait for it to shut down..
+        sleep $SHUTDOWN_SIGTERM_WAIT
+
+        ps -p $pid >>/dev/null 2>&1
+        let retval=$?
+        if [ $retval -eq 0 ]; then
+          # It's still running, so we'll send a SIGTERM next.
+          kill -9 $pid
+
+          # Wait for it to shut down..
+          sleep $SHUTDOWN_SIGKILL_WAIT
+
+          # If it's still running, we fail any installation right here.
+          ps -p $pid >>/dev/null 2>&1
+          let retval=$?
+          if [ $retval -eq 0 ]; then
+            showFAIL "Agent process $pid wouldn't stop even with a kill -9."
+            return 1
+          fi
+        fi
+      fi
+    else
+      info "Previously installed agent instance was not running."
+      return 0
+    fi
+  else
+    info "Previously installed agent instance was not running."
+    return 0
+  fi
+
+  info "Cronus agent stopped."
+  return 0
+}
+
+startAgent() {
+  # Determine whether to start it via upstart, daemontools, or another way.
+  if [ -x /sbin/initctl ]; then
+    info "Using upstart (sudo start cronus) to start the agent."
+    # Passwordless sudo, if the OS was configured properly.  See top comments.
+    sudo start cronus >>$INSTALL_LOG_FILE 2>&1
+    let retval=$?
+    if [ $retval -eq 0 ]; then
+      info "Cronus agent started."
+    else
+      # There are race conditions (at least on Ubuntu 11.10, possibly others)
+      # where upstart's start command fails only because upstart itself was
+      # already starting the service in another process, so we'll wait a few
+      # seconds and re-status it.
+      sleep 3
+      sudo status cronus | grep running >>$INSTALL_LOG_FILE 2>&1
+      let retval=$?
+      if [ $retval -eq 0 ]; then
+        info "Cronus agent started."
+      else
+        error "Agent startup failure."
+        error "Startup command was: sudo start cronus"
+      fi
+    fi
+  else
+    which svc >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+      info "Using upstart (sudo svc -u cronus) to start the agent."
+      # Passwordless sudo, if the OS was configured properly.  See top comments.
+      sudo svc -u cronus >>$INSTALL_LOG_FILE 2>&1
+      let retval=$?
+      if [ $retval -eq 0 ]; then
+        info "Cronus agent started."
+      else
+        error "Agent startup failure."
+        error "Startup command was: sudo svc -u cronus"
+      fi
+    else
+      # We don't have upstart nor daemontools.  Just call the cronus start script.
+      info "Using the cronus start script ($AGENT_INSTALLED_PACKAGES/agent/${agentVersion}.unix/cronus/scripts/startup) to start the agent."
+      "$AGENT_INSTALLED_PACKAGES/agent/${agentVersion}.unix/cronus/scripts/startup" nodaemon >>$INSTALL_LOG_FILE 2>&1
+      let retval=$?
+      if [ $retval -eq 0 ]; then
+        info "Cronus agent started."
+      else
+        error "Agent startup failure."
+        error "Startup command was: "$AGENT_INSTALLED_PACKAGES/agent/${agentVersion}.unix/cronus/scripts/startup" nodaemon"
+      fi
+    fi
+  fi
+
+  return $retval
+}
+
+removeInstallation() {
+  local agentVersion="$1"
+  local pythonVersion="$2"
+
+  info "Removing existing agent installation of the same version."
+
+  # TODO
+}
+
+# This function upgrades or installs the agent.
+upgrade() {
+  local agentVersion="$1"
+  local pythonVersion="$2"
+
+  local force="false"
+
+  if [ ! $agentVersion ]; then
+    agentVersion="$INSTALL_AGENT_VERSION"
+  fi
+  if [ ! $pythonVersion ]; then
+    pythonVersion="$INSTALL_PYTHON_VERSION"
+  fi
+
+  # Detect the OS brand, version, and architecture.
+  local osBrand osVersion osArch
+  detectOS
+
+  # TODO: Stop here if the OS brand/version/arch trio is something that
+  #       the agent does not support.
+
+  local isUpgrade="false"
+
+  # Up front: download the required packages for the new agent.
+  local lowercaseOsBrand="$(tr [A-Z] [a-z] <<< "$osBrand")"
+  local mappedOsBrand="$lowercaseOsBrand"
+  local osVersionNumeric="$osVersion"
+  if [ "$osBrand" == "Ubuntu" ]; then
+    if [[ "$osVersion" =~ (^11) ]]; then
+      osVersionNumeric="11"
+    else
+      if [ "$osVersion" == "12.04" ]; then
+        osVersionNumeric="1204"
+      else
+        osVersionNumeric=""
+      fi
+    fi
+  fi
+  if [ "$osBrand" == "CentOS" ]; then
+    if [[ "$osVersion" =~ (^6) ]]; then
+      osVersionNumeric="6"
+    else
+      osVersionNumeric=""
+    fi
+  fi
+  if [ "$osBrand" == "RedHatEnterpriseServer" ]; then
+    mappedOsBrand="centos"
+    if [[ "$osVersion" =~ (^6) ]]; then
+      osVersionNumeric="6"
+    else
+      osVersionNumeric=""
+    fi
+  fi
+  local osVer="${mappedOsBrand}${osVersionNumeric}"
+  local pythonPackage="python_package-$pythonVersion.$osVer.cronus"
+  local agentConfigPackage="agent_config-${agentVersion}prod.unix.cronus"
+  local agentPackage="agent-$agentVersion.unix.cronus"
+  info "Getting the required packages for agent v${agentVersion} .."
+  getPackageFile $pythonPackage $INSTALL_DOWNLOAD_DIR && \
+  getPackageFile $agentConfigPackage $INSTALL_DOWNLOAD_DIR && \
+  getPackageFile $agentPackage $INSTALL_DOWNLOAD_DIR
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    showFAIL "Agent installation failed."
+    return $retval
+  fi
+
+  # Detect whether there is any existing installation of a cronus agent.
+  detectAgentInstalled $agentVersion
+  if [ $? -eq 0 ]; then
+    isUpgrade="true"
+
+    # TODO: detect if it's the same version
+    if [ "$force" != "false" ]; then
+      # If it's the same version we want to install, we'll delete the installed
+      # tree and install a new one.
+      removeAgentInstallation $agentVersion $pythonVersion
+
+    else
+      # We're not forcing the install, so we exit happily here.
+      return 0
+    fi
+  fi
+
+  # Detect whether the current user has write permission to install/upgrade.
+  detectWritableTree
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+
+  # Install and activate the new copy/version of the agent.
+  # While this happens, any previously installed version of the agent stays
+  # running.
+  install $agentVersion $pythonVersion $AGENT_INSTALLED_PACKAGES
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    showFAIL "Installation of new agent failed."
+    return $retval
+  fi
+
+  # If an agent's running, shut it down gracefully, and make sure it's down.
+  stopAgent
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    showFAIL "Unable to stop previous agent version."
+    return $retval
+  fi
+
+  # Activate the new version of the agent.
+  info "Activating the new agent."
+  local packageArch=$(echo $pythonPackage | sed -e 's/\(.*\)-\(.*\).cronus/\2/' | sed -e 's/\(.*\)\.\([^.]*\)/\2/')
+  activatePackageVersion "python_package" "$pythonVersion" "$packageArch" $AGENT_INSTALLED_PACKAGES && \
+  packageArch=$(echo $agentPackage | sed -e 's/\(.*\)-\(.*\).cronus/\2/' | sed -e 's/\(.*\)\.\([^.]*\)/prod.\2/')
+  activatePackageVersion "agent_config" "$agentVersion" "$packageArch" $AGENT_INSTALLED_PACKAGES && \
+  packageArch=$(echo $agentPackage | sed -e 's/\(.*\)-\(.*\).cronus/\2/' | sed -e 's/\(.*\)\.\([^.]*\)/\2/')
+  activatePackageVersion "agent" "$agentVersion" "$packageArch" $AGENT_INSTALLED_PACKAGES
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    showFAIL "Installation of new agent failed."
+    return $retval
+  fi
+
+  # Start the agent.
+  startAgent
+  let retval=$?
+  if [ $retval -ne 0 ]; then
+    error "Installation of new agent succeeded, but agent startup failed."
+    error "For details, see the logs:"
+    error "  $INSTALL_LOG_FILE"
+    error "  $AGENT_INSTALLED_PACKAGES/agent/${agentVersion}.unix/logs/agent.log"
+    showFAIL ""
+    return $retval
+  fi
+
+  local action="installed"
+  if [ "$isUpgrade" == "true" ]; then action="upgraded"; fi
+  local actionOnHostOs="$action on $HOSTNAME ($osBrand $osVersion $osArch)"
+  if [ $retval -eq 0 ]; then
+    showSUCCESS "Agent $agentVersion $actionOnHostOs"
+  else
+    showFAIL "Agent $agentVersion not $actionOnHostOs"
+  fi
+
+  return $?
+}
+
+info "Upgrading / installing cronus agent."
+attn "See this log file for more detail: $INSTALL_LOG_FILE"
+
+# Upgrade or install the agent.
+upgrade $@
+
+exit $?

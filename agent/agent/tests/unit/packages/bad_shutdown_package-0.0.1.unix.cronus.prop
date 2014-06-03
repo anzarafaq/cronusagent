@@ -1,0 +1,8 @@
+{
+"name":"bad_shutdown_package-0.0.1.unix.cronus",
+"md5":"31ad194c17fb12885e8d66e38c9c3e74",
+"description":"bad test packages",
+"long description":"http://sbewiki.arch.ebay.com/wiki/doku.php?id=developer:domains:automation:cronus:design",
+"size":561,
+"contact":"dl-ebay-search-dev-sci-core@ebay.com"
+}
